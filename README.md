@@ -2,7 +2,7 @@
 
 本仓库是《Negency AI 可见性白皮书》所定义标准的**参考实现**：方法论公开、公式公开、代码公开，任何人都可以复核、复现、反驳。
 
-> 白皮书即将发布。本仓库的完整标准文档见 [STANDARD.md](STANDARD.md)。
+> 白皮书 v1.1 已发布（2026-11-25）：中文全文见 [whitepaper/whitepaper-zh.md](whitepaper/whitepaper-zh.md)，英文执行摘要见 [whitepaper/whitepaper-en.md](whitepaper/whitepaper-en.md)；在线版与 PDF 下载见 https://www.negency.com/zh/reports/ai-visibility-whitepaper/。本仓库的完整标准文档见 [STANDARD.md](STANDARD.md)。
 
 ## 标准概览
 
@@ -22,6 +22,9 @@ v2 把 AI 可见性测量从"网站准备度检查"升级为"AI 回答中的结�
 
 ```
 ├── STANDARD.md            标准全文（A/B/C 三层、采样纪律、缺口→整改映射）
+├── whitepaper/            白皮书 v1.1（中文全文 + 英文执行摘要，Markdown 版）
+│   ├── whitepaper-zh.md   中文全文（54 条参考文献）
+│   └── whitepaper-en.md   英文执行摘要、目录与关键数字
 ├── audit_engine/          v1 体检引擎（独立版，纯标准库）
 │   └── audit.py           run_audit(domain)：约 30 项信号，五类加权评分
 ├── metrics/               v2 B 层结果指标计算（纯标准库）

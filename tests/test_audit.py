@@ -6,7 +6,10 @@ fake site, so these tests never touch the network.
 
 from __future__ import annotations
 
+import gzip
+import http.client
 import unittest
+import urllib.error
 from unittest import mock
 from urllib.parse import urlparse
 
@@ -201,3 +204,146 @@ class RunAuditTests(unittest.TestCase):
             with self.subTest(domain=bad):
                 with self.assertRaises(ValueError):
                     audit.run_audit(bad)
+
+
+class _FakeHTTPResponse:
+    """Minimal stand-in for the object urllib.request.urlopen returns."""
+
+    def __init__(self, status=200, body=b"", headers=None, read_exc=None):
+        self.status = status
+        self._body = body
+        self._headers = headers or {}
+        self._read_exc = read_exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def geturl(self):
+        return "https://example.com/"
+
+    @property
+    def headers(self):
+        return self._headers
+
+    def read(self, n=-1):
+        if self._read_exc is not None:
+            raise self._read_exc
+        return self._body
+
+
+class FetchRobustnessTests(unittest.TestCase):
+    """_fetch under an egress proxy that cuts responses short (A02c).
+
+    Observed failure: the homepage gzip stream cut at 8029 bytes, and
+    flaky "Remote end closed connection without response" resets. The
+    old code lost the whole fetch in both cases — truncated gzip raised
+    an uncaught EOFError out of run_audit, and IncompleteRead.partial
+    was discarded.
+    """
+
+    def _gzip_home(self):
+        return gzip.compress(GOOD_HOME_HTML.encode("utf-8"))
+
+    def _gzip_headers(self):
+        return {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Encoding": "gzip",
+        }
+
+    def test_truncated_gzip_decodes_prefix_not_exception(self):
+        raw = self._gzip_home()
+        cut = raw[: len(raw) // 2]
+        with self.assertRaises(EOFError):
+            gzip.decompress(cut)
+        decoded = audit._decode_body(cut, "gzip")
+        self.assertTrue(decoded.startswith(b"<!DOCTYPE html>"))
+        self.assertIn(b"<title>", decoded)
+
+    def test_truncated_gzip_too_short_for_any_output_returns_empty(self):
+        raw = self._gzip_home()
+        decoded = audit._decode_body(raw[:10], "gzip")
+        self.assertEqual(decoded, b"")
+
+    def test_fetch_retries_remote_disconnect_then_succeeds(self):
+        ok = _FakeHTTPResponse(
+            status=200, body=b"hello", headers={"Content-Type": "text/plain"})
+        calls = {"n": 0}
+
+        def flaky(request, timeout=6):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise http.client.RemoteDisconnected(
+                    "Remote end closed connection without response")
+            return ok
+
+        with mock.patch("urllib.request.urlopen", side_effect=flaky):
+            result = audit._fetch("https://example.com/", audit.BROWSER_UA)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["body"], b"hello")
+        self.assertIsNone(result["error"])
+        self.assertEqual(calls["n"], 3)
+
+    def test_fetch_salvages_partial_after_repeated_truncation(self):
+        gz = self._gzip_home()
+        cut = gz[: len(gz) // 2]
+        exc = http.client.IncompleteRead(partial=cut, expected=len(gz))
+        resp = _FakeHTTPResponse(
+            status=200, headers=self._gzip_headers(), read_exc=exc)
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            result = audit._fetch("https://example.com/", audit.BROWSER_UA)
+        self.assertEqual(result["status"], 200)
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["body"].startswith(b"<!DOCTYPE html>"))
+        self.assertIn(b"<title>", result["body"])
+
+    def test_fetch_empty_partial_after_retries_reports_error(self):
+        exc = http.client.IncompleteRead(partial=b"", expected=20458)
+        resp = _FakeHTTPResponse(
+            status=200, headers=self._gzip_headers(), read_exc=exc)
+        calls = {"n": 0}
+
+        def counting(request, timeout=6):
+            calls["n"] += 1
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=counting):
+            result = audit._fetch("https://example.com/", audit.BROWSER_UA)
+        self.assertIsNone(result["status"])
+        self.assertEqual(result["body"], b"")
+        self.assertTrue(result["error"])
+        self.assertEqual(calls["n"], 3)
+
+    def test_fetch_does_not_retry_http_error(self):
+        calls = {"n": 0}
+
+        def erroring(request, timeout=6):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                request.full_url, 404, "Not Found", {}, None)
+
+        with mock.patch("urllib.request.urlopen", side_effect=erroring):
+            result = audit._fetch("https://example.com/", audit.BROWSER_UA)
+        self.assertEqual(result["status"], 404)
+        self.assertEqual(calls["n"], 1)
+
+    def test_run_audit_survives_truncated_homepage(self):
+        gz = self._gzip_home()
+        cut = gz[: len(gz) // 2]
+        partial_exc = http.client.IncompleteRead(partial=cut, expected=len(gz))
+
+        def fake_urlopen(request, timeout=6):
+            path = urlparse(request.full_url).path or "/"
+            if path == "/":
+                return _FakeHTTPResponse(
+                    status=200, headers=self._gzip_headers(),
+                    read_exc=partial_exc)
+            return _FakeHTTPResponse(status=200, body=b"", headers={})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = audit.run_audit("example.com")
+        self.assertIsNotNone(result["total_score"])
+        checks = _checks_by_id(result, "entity_structure")
+        self.assertEqual(checks["title_tag"]["status"], "pass")

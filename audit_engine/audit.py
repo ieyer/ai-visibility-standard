@@ -2,7 +2,7 @@
 
 Standalone extraction of the audit engine behind Negency's public
 "AI 可见度体检" tool, taken from the NegencyPro website repository
-(commit f065726, file ``core/audit.py``). The only change from the
+(commit f9721f2, file ``core/audit.py`` — V2-21 egress-truncation fix included). The only change from the
 production copy is the removal of the single Django dependency
 (``django.utils.timezone`` -> stdlib ``datetime``); all scoring logic,
 weights and check definitions are byte-identical in behaviour.
@@ -118,15 +118,56 @@ def _decode_body(raw: bytes, content_encoding: str) -> bytes:
     encoding = (content_encoding or "").lower()
     try:
         if "gzip" in encoding:
-            return gzip.decompress(raw)
+            try:
+                return gzip.decompress(raw)
+            except (OSError, EOFError, zlib.error):
+                # Truncated gzip stream: an egress proxy cut the response
+                # short mid-body (A02c — observed cut at 8029 bytes).
+                # gzip.decompress raises EOFError on a truncated stream,
+                # which the old handler did not catch, so the exception
+                # escaped _fetch and failed the whole audit. A streaming
+                # decoder still yields the decompressed prefix, which
+                # keeps the audit usable instead of failing the run.
+                return zlib.decompressobj(31).decompress(raw)
         if "deflate" in encoding:
             try:
                 return zlib.decompress(raw)
             except zlib.error:
                 return zlib.decompress(raw, -zlib.MAX_WBITS)
-    except (OSError, zlib.error):
+    except (OSError, EOFError, zlib.error):
         return raw
     return raw
+
+
+# How many times _fetch retries one URL when the connection is cut short
+# or reset (egress proxy flakiness, A02c). HTTP status responses
+# (including HTTPError) are final and are never retried.
+_FETCH_ATTEMPTS = 3
+_FETCH_RETRY_DELAY = 0.5  # seconds; doubled on the second retry
+
+
+def _read_limited(stream) -> tuple[bytes, bool]:
+    """Read up to _MAX_BODY_BYTES; return (raw, truncated).
+
+    When the connection is cut short mid-body, ``http.client`` raises
+    IncompleteRead — its ``partial`` attribute still holds the bytes
+    that arrived, which the caller can salvage.
+    """
+    try:
+        return stream.read(_MAX_BODY_BYTES), False
+    except http.client.IncompleteRead as exc:
+        return exc.partial or b"", True
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """True for transient connection failures worth one more attempt."""
+    if isinstance(
+        exc,
+        (http.client.RemoteDisconnected, TimeoutError, ConnectionResetError),
+    ):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, (TimeoutError, ConnectionResetError))
 
 
 def _fetch(url: str, ua: str, timeout: int = FETCH_TIMEOUT) -> dict:
@@ -134,6 +175,11 @@ def _fetch(url: str, ua: str, timeout: int = FETCH_TIMEOUT) -> dict:
 
     Keys: url, final_url, status (int or None), headers (lower-cased),
     body (bytes, decompressed), elapsed (seconds), error (str or None).
+
+    A response cut short by the network (egress proxy, A02c) is retried;
+    if every attempt is cut short, the longest partial body received is
+    still decoded (truncated gzip yields its decompressed prefix) and
+    returned with its HTTP status instead of failing the fetch.
     """
     started = time.monotonic()
     result = {
@@ -154,33 +200,77 @@ def _fetch(url: str, ua: str, timeout: int = FETCH_TIMEOUT) -> dict:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            result["status"] = response.status
-            result["final_url"] = response.geturl()
-            result["headers"] = {
-                key.lower(): value for key, value in response.headers.items()
-            }
-            raw = response.read(_MAX_BODY_BYTES)
-            result["body"] = _decode_body(
-                raw, result["headers"].get("content-encoding", "")
-            )
-    except urllib.error.HTTPError as exc:
-        result["status"] = exc.code
-        result["final_url"] = exc.geturl() or url
-        if exc.headers is not None:
-            result["headers"] = {
-                key.lower(): value for key, value in exc.headers.items()
-            }
+    best_raw = b""
+    best_snapshot = None
+    last_error = None
+    for attempt in range(_FETCH_ATTEMPTS):
         try:
-            raw = exc.read(_MAX_BODY_BYTES)
-            result["body"] = _decode_body(
-                raw, result["headers"].get("content-encoding", "")
-            )
-        except Exception:
-            result["body"] = b""
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
-        result["error"] = str(getattr(exc, "reason", exc))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result["status"] = response.status
+                result["final_url"] = response.geturl()
+                result["headers"] = {
+                    key.lower(): value for key, value in response.headers.items()
+                }
+                raw, truncated = _read_limited(response)
+                if truncated:
+                    if len(raw) > len(best_raw):
+                        best_raw = raw
+                        best_snapshot = (
+                            result["status"],
+                            result["final_url"],
+                            dict(result["headers"]),
+                        )
+                    last_error = f"incomplete read ({len(raw)} bytes)"
+                    if attempt < _FETCH_ATTEMPTS - 1:
+                        time.sleep(_FETCH_RETRY_DELAY * (attempt + 1))
+                        continue
+                    break
+                result["body"] = _decode_body(
+                    raw, result["headers"].get("content-encoding", "")
+                )
+                result["elapsed"] = round(time.monotonic() - started, 3)
+                return result
+        except urllib.error.HTTPError as exc:
+            result["status"] = exc.code
+            result["final_url"] = exc.geturl() or url
+            if exc.headers is not None:
+                result["headers"] = {
+                    key.lower(): value for key, value in exc.headers.items()
+                }
+            try:
+                raw, _truncated = _read_limited(exc)
+                result["body"] = _decode_body(
+                    raw, result["headers"].get("content-encoding", "")
+                )
+            except Exception:
+                result["body"] = b""
+            result["elapsed"] = round(time.monotonic() - started, 3)
+            return result
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            last_error = str(getattr(exc, "reason", exc))
+            if _is_retryable(exc) and attempt < _FETCH_ATTEMPTS - 1:
+                time.sleep(_FETCH_RETRY_DELAY * (attempt + 1))
+                continue
+            result["error"] = last_error
+            break
+    if best_raw:
+        # Every attempt was cut short: salvage the longest partial body.
+        status, final_url, headers = best_snapshot
+        result["status"] = status
+        result["final_url"] = final_url
+        result["headers"] = headers
+        result["body"] = _decode_body(
+            best_raw, headers.get("content-encoding", "")
+        )
+        result["error"] = None
+    else:
+        # Nothing usable arrived: report a failed fetch, not a 200 with
+        # an empty body (the old code left the status behind, which let
+        # an empty body score as a successful bot fetch).
+        if result["error"] is None and last_error is not None:
+            result["error"] = last_error
+        result["status"] = None
+        result["body"] = b""
     result["elapsed"] = round(time.monotonic() - started, 3)
     return result
 

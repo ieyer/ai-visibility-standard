@@ -69,7 +69,7 @@ python -m unittest discover -s tests -v
 - **没有不确定度的比率不进报告。** 所有比率带 bootstrap 95% CI；变化不跨过噪声 floor 不报"上升/下降"。
 - **逐引擎报告。** 跨引擎域名重叠极低（Jaccard 约 0.10–0.25），混合数字没有测量意义。
 - **示例数据是合成的。** `examples/synthetic_runs.csv` 由固定种子随机生成，仅演示用法；本仓库不含任何真实面板测量数据。
-- **v1 引擎的定位。** `audit_engine` 是 v1"准备度卫生"体检的实现；v2 中它降级为 A 层门槛检查，不再作为可见度的代理指标。引擎取自 Negency 官网仓库（NegencyPro，提交 f065726，`core/audit.py`），唯一改动是去掉 Django 依赖（改用标准库 `datetime`），评分逻辑与行为完全一致。
+- **v1 引擎的定位。** `audit_engine` 是 v1"准备度卫生"体检的实现；v2 中它降级为 A 层门槛检查，不再作为可见度的代理指标。引擎取自 Negency 官网仓库（NegencyPro，提交 f9721f2，`core/audit.py`），唯一改动是去掉 Django 依赖（改用标准库 `datetime`），评分逻辑与行为完全一致。
 
 ## 许可证
 
